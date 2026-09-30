@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          - os: macos-latest
+            python-version: "3.14"
+          - os: windows-latest
+            python-version: "3.14"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run tests with coverage
+        run: uv run --locked pytest --cov
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+      - run: uv run --locked ruff check .
+      - run: uv run --locked ruff format --check .
+      - run: uv run --locked mypy parisim
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Validate metadata
+        run: uvx twine check --strict dist/*
+
+      - name: Install the wheel in a clean environment and smoke-test it
+        run: |
+          uv venv /tmp/smoke
+          VIRTUAL_ENV=/tmp/smoke uv pip install dist/*.whl
+          /tmp/smoke/bin/python -c "
+          import sys, parisim
+          r = parisim.Matcher().compare('abc', 'abd')
+          assert r.scores and not r.errors, r
+          heavy = [m for m in ('numpy', 'pandas', 'matplotlib', 'fastembed') if m in sys.modules]
+          assert not heavy, f'core install pulled in {heavy}'
+          print('smoke test OK:', parisim.__version__)
+          "
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
