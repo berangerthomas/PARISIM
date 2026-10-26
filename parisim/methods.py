@@ -16,17 +16,16 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from functools import partial
+from typing import TypeVar
 
 import jellyfish
 from rapidfuzz import fuzz
 from rapidfuzz.distance import Hamming, Indel, JaroWinkler, Levenshtein
 
-from parisim.embeddings import Embedding
-
 __all__ = [
     "BUILTINS",
-    "OPT_IN",
     "Similarity",
     "hamming",
     "indel_ratio",
@@ -42,6 +41,30 @@ __all__ = [
 
 #: A similarity method: ``(a, b) -> score in [0, 1]``, or ``None`` if not applicable.
 Similarity = Callable[[str, str], float | None]
+
+_Method = TypeVar("_Method", bound=Similarity)
+_Repr = TypeVar("_Repr")
+
+
+def _one_to_many(
+    represent: Callable[[str], _Repr], compare: Callable[[_Repr, _Repr], float]
+) -> Callable[[_Method], _Method]:
+    """Decorate a method computing ``compare(represent(a), represent(b))``.
+
+    The method gets a ``one_to_many(query, candidates)`` attribute, which
+    ``Matcher.compare_one_to_many`` calls instead of the method: it represents
+    the query once, not once per candidate.
+    """
+
+    def one_to_many(query: str, candidates: Sequence[str]) -> list[float]:
+        represented = represent(query)
+        return [compare(represented, represent(c)) for c in candidates]
+
+    def decorate(method: _Method) -> _Method:
+        method.one_to_many = one_to_many  # type: ignore[attr-defined]
+        return method
+
+    return decorate
 
 
 # -- Character level ------------------------------------------------------------
@@ -101,7 +124,28 @@ _TOKEN_PATTERN = r"(?u)\b\w\w+\b"
 # ln((1 + n) / (1 + df)) + 1 with n = 2, df = 1. A word found in both gets 1.
 _IDF_UNSHARED = math.log(3 / 2) + 1
 
+_Words = tuple[str, Counter[str]]
 
+
+def _words(s: str, token_pattern: str = _TOKEN_PATTERN, lowercase: bool = True) -> _Words:
+    """*s*, lowercased if requested, and the count of each of its words."""
+    if lowercase:
+        s = s.lower()
+    return s, Counter(re.findall(token_pattern, s))
+
+
+def _tfidf(wa: _Words, wb: _Words) -> float:
+    """``tfidf_cosine`` of two strings, given as ``_words(a)`` and ``_words(b)``."""
+    (a, ta), (b, tb) = wa, wb
+    if not ta or not tb:
+        return float(a == b)
+    dot = sum(count * tb[word] for word, count in ta.items() if word in tb)
+    norm_a = sum((c if w in tb else c * _IDF_UNSHARED) ** 2 for w, c in ta.items())
+    norm_b = sum((c if w in ta else c * _IDF_UNSHARED) ** 2 for w, c in tb.items())
+    return dot / math.sqrt(norm_a * norm_b)
+
+
+@_one_to_many(_words, _tfidf)
 def tfidf_cosine(
     a: str,
     b: str,
@@ -117,24 +161,18 @@ def tfidf_cosine(
     overlap. To keep one-letter words, use
     ``functools.partial(tfidf_cosine, token_pattern=r"(?u)\\b\\w+\\b")``.
     """
-    if lowercase:
-        a, b = a.lower(), b.lower()
-    ta = Counter(re.findall(token_pattern, a))
-    tb = Counter(re.findall(token_pattern, b))
-    if not ta or not tb:
-        return float(a == b)
-    dot = sum(count * tb[word] for word, count in ta.items() if word in tb)
-    norm_a = sum((c if w in tb else c * _IDF_UNSHARED) ** 2 for w, c in ta.items())
-    norm_b = sum((c if w in ta else c * _IDF_UNSHARED) ** 2 for w, c in tb.items())
-    return dot / math.sqrt(norm_a * norm_b)
+    return _tfidf(
+        _words(a, token_pattern, lowercase), _words(b, token_pattern, lowercase)
+    )
 
 
 # -- Phonetic -------------------------------------------------------------------
 
 _LATIN_LETTER = re.compile("[A-Za-z]")
+_Codes = Counter[tuple[str, str]]
 
 
-def _phonetic_codes(s: str, encode: Callable[[str], str]) -> Counter[tuple[str, str]]:
+def _phonetic_codes(s: str, encode: Callable[[str], str]) -> _Codes:
     """Phonetic code of each word with Latin letters; other words (numbers,
     punctuation, other scripts) are kept as is, so "66" and "67" differ."""
     return Counter(
@@ -143,24 +181,29 @@ def _phonetic_codes(s: str, encode: Callable[[str], str]) -> Counter[tuple[str, 
     )
 
 
-def _phonetic_ratio(a: str, b: str, encode: Callable[[str], str]) -> float:
+def _phonetic_ratio(ca: _Codes, cb: _Codes) -> float:
     """Share of words that sound alike, pairing each word with at most one."""
-    ca, cb = _phonetic_codes(a, encode), _phonetic_codes(b, encode)
     if not ca or not cb:
         return float(not ca and not cb)
     return (ca & cb).total() / max(ca.total(), cb.total())
 
 
+_soundex_codes = partial(_phonetic_codes, encode=jellyfish.soundex)
+_metaphone_codes = partial(_phonetic_codes, encode=jellyfish.metaphone)
+
+
+@_one_to_many(_soundex_codes, _phonetic_ratio)
 def soundex(a: str, b: str) -> float:
     """Share of words with the same Soundex code. English-centric; words must
     start with the same letter: Robert ~ Rupert, but Philip !~ Filip."""
-    return _phonetic_ratio(a, b, jellyfish.soundex)
+    return _phonetic_ratio(_soundex_codes(a), _soundex_codes(b))
 
 
+@_one_to_many(_metaphone_codes, _phonetic_ratio)
 def metaphone(a: str, b: str) -> float:
     """Share of words with the same Metaphone code, from English pronunciation
     rules: Philip ~ Filip, Knight ~ Night, but Robert !~ Rupert."""
-    return _phonetic_ratio(a, b, jellyfish.metaphone)
+    return _phonetic_ratio(_metaphone_codes(a), _metaphone_codes(b))
 
 
 # -- Catalog --------------------------------------------------------------------
@@ -177,8 +220,4 @@ BUILTINS: dict[str, tuple[str, Similarity]] = {
     "tfidf_cosine": ("token", tfidf_cosine),
     "soundex": ("phonetic", soundex),
     "metaphone": ("phonetic", metaphone),
-    "embedding": ("semantic", Embedding()),
 }
-
-#: Methods that only run when requested by name or category: they load a model.
-OPT_IN = frozenset({"embedding"})

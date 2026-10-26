@@ -11,10 +11,7 @@ if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
 
-__all__ = ["DEFAULT_MODEL", "Embedding", "Encoder"]
-
-#: Multilingual (50+ languages, French included), Apache-2.0, 0.22 GB.
-DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+__all__ = ["Embedding", "Encoder"]
 
 #: Maps a list of texts to one vector per text (2-D array, list of lists...).
 Encoder = Callable[[list[str]], Any]
@@ -23,30 +20,31 @@ Encoder = Callable[[list[str]], Any]
 class Embedding:
     """Cosine similarity of text embeddings, clipped to [0, 1].
 
-    Texts can be encoded by:
+    There is no default model: texts are encoded by the one you choose, either
 
-    - a model name, loaded with fastembed (default backend, install the
-      ``embeddings`` extra) or with sentence-transformers;
-    - any function mapping a list of texts to one vector per text, to use an
-      embedding API (OpenAI, Mistral...) or your own model.
+    - a model name, with the *backend* library that loads it: ``"fastembed"``
+      (the ``embeddings`` extra) or ``"sentence-transformers"``;
+    - or any function mapping a list of texts to one vector per text, to use
+      an embedding API (OpenAI, Mistral...) or your own model.
 
     Vectors are cached, one per distinct text, and ``Matcher.compare_batch``
     encodes all the texts of a batch up front, *batch_size* texts per call.
 
     Usage::
 
-        Matcher(methods=["embedding"])   # built-in, uses DEFAULT_MODEL
         m.add_method("minilm", Embedding("all-MiniLM-L6-v2",
-                                         backend="sentence-transformers"))
+                                         backend="sentence-transformers",
+                                         batch_size=32))
         m.add_method("openai", Embedding(lambda texts: [
             d.embedding for d in client.embeddings.create(
                 input=texts, model="text-embedding-3-small").data
-        ]))
+        ], batch_size=100))
 
     Args:
         encoder: Model name, or ``list[str] -> vectors`` function.
         backend: ``"fastembed"`` or ``"sentence-transformers"``, the library
-            loading *encoder* when it is a model name.
+            loading *encoder*: required with a model name, refused with a
+            function.
         batch_size: Maximum number of texts per encoder call.
 
     Examples:
@@ -54,7 +52,7 @@ class Embedding:
 
         >>> def count_vowels(texts):
         ...     return [[t.count(v) for v in "aeiou"] for t in texts]
-        >>> vowels = Embedding(count_vowels)
+        >>> vowels = Embedding(count_vowels, batch_size=32)
         >>> vowels("banana", "papaya")
         1.0
         >>> vowels("banana", "kiwi")
@@ -65,16 +63,22 @@ class Embedding:
 
     def __init__(
         self,
-        encoder: str | Encoder = DEFAULT_MODEL,
+        encoder: str | Encoder,
         *,
-        backend: str = "fastembed",
-        batch_size: int = 256,
+        backend: str | None = None,
+        batch_size: int,
     ) -> None:
-        if not isinstance(encoder, str) and not callable(encoder):
+        if isinstance(encoder, str):
+            if backend not in _LOADERS:
+                raise ValueError(
+                    f"choose the backend loading {encoder!r}: one of "
+                    f"{list(_LOADERS)}, got {backend!r}"
+                )
+        elif not callable(encoder):
             kind = type(encoder).__name__
             raise TypeError(f"encoder must be a model name or a function, got {kind}")
-        if backend not in _LOADERS:
-            raise ValueError(f"Unknown backend {backend!r}; choose from {list(_LOADERS)}")
+        elif backend is not None:
+            raise TypeError("backend only applies to a model name, not to a function")
         if batch_size < 1:
             raise ValueError(f"batch_size must be at least 1, got {batch_size}")
         self.encoder = encoder
@@ -113,8 +117,11 @@ class Embedding:
     def __repr__(self) -> str:
         if callable(self.encoder):
             name = getattr(self.encoder, "__name__", type(self.encoder).__name__)
-            return f"Embedding({name})"
-        return f"Embedding({self.encoder!r}, backend={self.backend!r})"
+            return f"Embedding({name}, batch_size={self.batch_size})"
+        return (
+            f"Embedding({self.encoder!r}, backend={self.backend!r}, "
+            f"batch_size={self.batch_size})"
+        )
 
 
 def _numpy() -> Any:
@@ -139,8 +146,9 @@ def _fastembed(model: str) -> Encoder:
             "The fastembed backend requires fastembed: pip install 'parisim[embeddings]'"
         ) from exc
     with warnings.catch_warnings():
-        # fastembed warns that DEFAULT_MODEL now uses mean pooling: that is the
-        # pooling it was trained with, so there is nothing to act on.
+        # fastembed warns that some models, such as
+        # paraphrase-multilingual-MiniLM-L12-v2, now use mean pooling: the pooling
+        # they were trained with, so there is nothing to act on.
         warnings.filterwarnings("ignore", "The model .* now uses mean pooling")
         embedder = TextEmbedding(model_name=model)
     return lambda texts: list(embedder.embed(texts))

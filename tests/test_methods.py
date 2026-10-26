@@ -8,7 +8,6 @@ import pytest
 
 from parisim.methods import (
     BUILTINS,
-    OPT_IN,
     hamming,
     indel_ratio,
     jaro_winkler,
@@ -21,8 +20,7 @@ from parisim.methods import (
     token_sort,
 )
 
-# Every built-in method that runs without a model.
-STRING_METHODS = {name: fn for name, (_, fn) in BUILTINS.items() if name not in OPT_IN}
+STRING_METHODS = {name: fn for name, (_, fn) in BUILTINS.items()}
 
 EDGE_STRINGS = [
     "",
@@ -75,11 +73,17 @@ def test_scores_are_floats_within_unit_range(name, a, b):
     assert score is None or (isinstance(score, float) and 0.0 <= score <= 1.0)
 
 
+@pytest.mark.parametrize("name", ["tfidf_cosine", "soundex", "metaphone"])
+def test_one_to_many_hook_gives_the_pairwise_scores(name):
+    fn = STRING_METHODS[name]
+    strings = [*EDGE_STRINGS, *(s for pair in PAIRS for s in pair)]
+    for query in strings:
+        assert fn.one_to_many(query, strings) == [fn(query, s) for s in strings], query
+
+
 def test_catalog_categories():
-    categories = {name: category for name, (category, _) in BUILTINS.items()}
-    assert set(categories.values()) == {"character", "token", "phonetic", "semantic"}
-    assert set(BUILTINS) >= OPT_IN
-    assert categories["embedding"] == "semantic"
+    categories = {category for category, _ in BUILTINS.values()}
+    assert categories == {"character", "token", "phonetic"}
 
 
 # -- Character level --------------------------------------------------------------

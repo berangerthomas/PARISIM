@@ -9,7 +9,7 @@ import warnings
 from collections.abc import Callable, Iterable, Sequence
 from typing import cast
 
-from parisim.methods import BUILTINS, OPT_IN, Similarity
+from parisim.methods import BUILTINS, Similarity
 from parisim.result import BatchResult, MatchResult
 
 #: A preprocessing step: ``str -> str``.
@@ -24,7 +24,7 @@ class Matcher:
 
     Args:
         methods: Name(s) of the methods to run. ``None`` (default) runs every
-            built-in method except the opt-in ``"embedding"``.
+            built-in method. Add an ``Embedding`` with ``add_method``.
         categories: Category name(s) of the methods to run, used when
             *methods* is ``None``.
         preprocess: ``str -> str`` function(s) applied in order to both strings
@@ -90,8 +90,15 @@ class Matcher:
         return BatchResult(self._run(_check_pairs(pairs)))
 
     def compare_one_to_many(self, query: str, candidates: Iterable[str]) -> BatchResult:
-        """Compare *query* with each of *candidates*."""
-        return BatchResult(self._run(_check_pairs((query, c) for c in candidates)))
+        """Compare *query* with each of *candidates*.
+
+        The query is preprocessed once. A method with a
+        ``one_to_many(query, candidates)`` attribute, returning one score per
+        candidate, is called once for all of them: ``tfidf_cosine`` and the
+        phonetic methods use it to encode the query only once.
+        """
+        pairs = _check_pairs((query, c) for c in candidates)
+        return BatchResult(self._run(pairs, one_to_many=True))
 
     def add_method(self, name: str, fn: Similarity, category: str | None = None) -> None:
         """Add a method to this matcher, or replace the one called *name*.
@@ -123,12 +130,21 @@ class Matcher:
 
     # -- Internals --------------------------------------------------------------
 
-    def _run(self, pairs: list[tuple[str, str]]) -> list[MatchResult]:
-        cleaned = [(self._clean(a), self._clean(b)) for a, b in pairs]
+    def _run(
+        self, pairs: list[tuple[str, str]], one_to_many: bool = False
+    ) -> list[MatchResult]:
+        """Score *pairs*; with *one_to_many*, they all share their first string."""
+        if not pairs:
+            return []
+        if one_to_many:
+            query = self._clean(pairs[0][0])
+            cleaned = [(query, self._clean(b)) for _, b in pairs]
+        else:
+            cleaned = [(self._clean(a), self._clean(b)) for a, b in pairs]
         categories = {name: category for name, (category, _) in self._methods.items()}
         results = [MatchResult(a, b, categories=categories) for a, b in pairs]
         for name, (_, fn) in self._methods.items():
-            self._score(name, fn, cleaned, results)
+            self._score(name, fn, cleaned, results, one_to_many)
             failures = [r.errors[name] for r in results if name in r.errors]
             if failures:
                 # stacklevel=3 blames the user's line: every public compare* method
@@ -148,21 +164,31 @@ class Matcher:
         fn: Similarity,
         cleaned: list[tuple[str, str]],
         results: list[MatchResult],
+        one_to_many: bool,
     ) -> None:
         """Run one method over every pair, recording scores and errors."""
+        hook = getattr(fn, "one_to_many", None) if one_to_many else None
         prepare = getattr(fn, "prepare", None)
-        if prepare is not None:  # e.g. Embedding: encode every text in a few calls
-            try:
+        scores: list[object] = []
+        try:
+            if hook is not None:  # e.g. phonetic methods: encode the query once
+                scores = list(hook(cleaned[0][0], [b for _, b in cleaned]))
+                if len(scores) != len(cleaned):
+                    raise ValueError(
+                        f"one_to_many: expected {len(cleaned)} scores, one per "
+                        f"candidate, got {len(scores)}"
+                    )
+            elif prepare is not None:  # e.g. Embedding: encode every text in a few calls
                 prepare([text for pair in cleaned for text in pair])
-            except Exception as exc:
-                if self._strict:
-                    raise
-                for result in results:
-                    result.errors[name] = _describe(exc)
-                return
-        for result, (a, b) in zip(results, cleaned, strict=True):
+        except Exception as exc:
+            if self._strict:
+                raise
+            for result in results:
+                result.errors[name] = _describe(exc)
+            return
+        for i, (result, (a, b)) in enumerate(zip(results, cleaned, strict=True)):
             try:
-                score = fn(a, b)
+                score = fn(a, b) if hook is None else scores[i]
                 if score is not None:
                     result.scores[name] = _as_score(score)
             except Exception as exc:
@@ -203,7 +229,7 @@ def _select(
         wanted = _as_list(categories)
         _check_known(wanted, Matcher.available_categories(), "category")
         return {n: m for n, m in BUILTINS.items() if m[0] in wanted}
-    return {n: m for n, m in BUILTINS.items() if n not in OPT_IN}
+    return dict(BUILTINS)
 
 
 def _as_list(names: str | Sequence[str]) -> list[str]:
@@ -255,6 +281,8 @@ def _is_missing(value: object) -> bool:
 
 def _as_score(value: object) -> float:
     """Return *value* as a float, if it is a similarity in [0, 1]."""
+    if type(value) is float and 0.0 <= value <= 1.0:  # fast path: most scores
+        return value
     if not isinstance(value, numbers.Real):
         raise TypeError(f"expected a number, got {type(value).__name__} {value!r}")
     score = float(value)

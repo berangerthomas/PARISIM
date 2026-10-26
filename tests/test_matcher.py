@@ -4,19 +4,29 @@ import json
 
 import pytest
 
-from parisim import Matcher
-from parisim.methods import BUILTINS, OPT_IN
+from parisim import Matcher, normalize
+from parisim.methods import BUILTINS
 
 
 def _boom(a: str, b: str) -> float:
     raise RuntimeError("boom")
 
 
+def _with_hook(one_to_many):
+    """A method scoring 0.5 pair by pair, with a one_to_many hook."""
+
+    def method(a, b):
+        return 0.5
+
+    method.one_to_many = one_to_many
+    return method
+
+
 # -- Selection --------------------------------------------------------------------
 
 
-def test_default_runs_every_built_in_method_but_the_opt_in_ones():
-    assert Matcher().methods == [n for n in BUILTINS if n not in OPT_IN]
+def test_default_runs_every_built_in_method():
+    assert Matcher().methods == list(BUILTINS)
 
 
 def test_a_single_name_is_accepted():
@@ -51,7 +61,6 @@ def test_available_methods_and_categories():
         "character",
         "token",
         "phonetic",
-        "semantic",
     ]
 
 
@@ -222,6 +231,74 @@ def test_compare_one_to_many():
     batch = Matcher("levenshtein").compare_one_to_many("paris", ["paris", "pari", "lyon"])
     assert [r.str1 for r in batch] == ["paris"] * 3
     assert [r["levenshtein"] for r in batch] == [1.0, 0.8, 0.0]
+
+
+def test_compare_one_to_many_gives_the_compare_batch_results():
+    m = Matcher(preprocess=normalize)
+    query = "Jean Dupont"
+    candidates = ["jean dupont", "DUPONT Jean", "Jean-Pierre Dupond", "", "route 66"]
+    fast = m.compare_one_to_many(query, candidates)
+    slow = m.compare_batch((query, c) for c in candidates)
+    assert [r.to_dict() for r in fast] == [r.to_dict() for r in slow]
+
+
+def test_compare_one_to_many_preprocesses_the_query_once():
+    seen = []
+
+    def spy(s):
+        seen.append(s)
+        return s
+
+    Matcher("levenshtein", preprocess=spy).compare_one_to_many("q", ["a", "b"])
+    assert seen == ["q", "a", "b"]
+
+
+def test_compare_one_to_many_of_no_candidates():
+    assert len(Matcher().compare_one_to_many("a", [])) == 0
+
+
+def test_compare_one_to_many_calls_the_hook_once():
+    calls = []
+
+    def one_to_many(query, candidates):
+        calls.append((query, candidates))
+        return [1.0] * len(candidates)
+
+    m = Matcher(methods=[], preprocess=str.lower)
+    m.add_method("hooked", _with_hook(one_to_many))
+    assert [r["hooked"] for r in m.compare_one_to_many("Q", ["A", "B"])] == [1.0, 1.0]
+    assert calls == [("q", ["a", "b"])]
+    assert m.compare("Q", "A")["hooked"] == 0.5  # other calls go pair by pair
+
+
+@pytest.mark.parametrize(
+    ("one_to_many", "errors"),
+    [
+        (_boom, ["RuntimeError: boom"] * 2),
+        (
+            lambda q, cs: [1.0],
+            ["ValueError: one_to_many: expected 2 scores, one per candidate, got 1"] * 2,
+        ),
+        (
+            lambda q, cs: [1.0, 85],
+            [None, "ValueError: expected a similarity in [0, 1], got 85"],
+        ),
+    ],
+    ids=["raises", "wrong-length", "invalid-score"],
+)
+def test_hook_failures_are_recorded(one_to_many, errors):
+    m = Matcher(methods=[])
+    m.add_method("hooked", _with_hook(one_to_many))
+    with pytest.warns(RuntimeWarning, match="'hooked' failed"):
+        batch = m.compare_one_to_many("q", ["a", "b"])
+    assert [r.errors.get("hooked") for r in batch] == errors
+
+
+def test_strict_mode_raises_hook_failures():
+    m = Matcher(methods=[], strict=True)
+    m.add_method("hooked", _with_hook(_boom))
+    with pytest.raises(RuntimeError, match="boom"):
+        m.compare_one_to_many("q", ["a"])
 
 
 def test_len_and_repr():

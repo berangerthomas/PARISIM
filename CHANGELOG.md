@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.0] - 2026-10-26
+
+### Removed
+- The default embedding model: the built-in `embedding` method, `DEFAULT_MODEL` and `OPT_IN` are gone, and `Matcher()` runs every built-in method. Add an `Embedding` of your choice with `add_method`.
+
+### Changed
+- `Embedding` has no default: it takes a model name with the `backend` that loads it, or a function, and a `batch_size`. A missing one raises an error. Its repr shows them.
+- `compare_one_to_many` is a third faster with every built-in method: the query is preprocessed once, and `tfidf_cosine`, `soundex` and `metaphone` encode it once instead of once per candidate. `compare_batch` is 10% faster. Scores are unchanged.
+
+### Added
+- A method can have a `one_to_many(query, candidates)` attribute returning one score per candidate: `compare_one_to_many` calls it once instead of calling the method on each pair.
+- The demo notebook compares an embedding model with the other methods throughout. It also shows how to search a list, and how to give a custom method a `one_to_many` attribute.
+
 ## [0.3.0] - 2026-09-30
 
 **The project is renamed PARISIM**: `pip install parisim`, `import parisim`. The `prism` name is taken on PyPI.

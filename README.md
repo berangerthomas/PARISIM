@@ -24,7 +24,7 @@ MatchResult('voiture rouge' vs 'automobile rouge')
 - Methods for typos, word order, truncation, pronunciation and meaning, all scoring in [0, 1].
 - Batches go straight to pandas: one row per pair, one column per method.
 - Light core (`rapidfuzz`, `jellyfish`); pandas, matplotlib and embeddings are optional.
-- Semantic similarity with any embedding model or API.
+- Semantic similarity with the embedding model or API you choose.
 - Python 3.10 to 3.14, fully typed.
 
 ## Installation
@@ -48,11 +48,11 @@ Extras: `pandas` for `to_pandas()`, `viz` for `plot()`, `embeddings` for the fas
 | extra or repeated words | `token_set` | Jean Dupont / M. Jean Dupont |
 | shared words | `tfidf_cosine` | rue de la Paix / 12 rue de la Paix |
 | pronunciation, English rules | `soundex`, `metaphone` | Philip / Filip |
-| meaning | `embedding` (opt-in) | voiture / automobile |
+| meaning | an `Embedding` of your choice | voiture / automobile |
 
 `levenshtein` counts a substitution as one edit, `indel_ratio` (the classic `fuzz.ratio`) as two. `hamming` returns no score for strings of different lengths. `soundex` needs the same first letter (Robert ~ Rupert), `metaphone` does not (Philip ~ Filip). Phonetic methods compare word by word; words without Latin letters, such as numbers, must match exactly.
 
-Methods fall into four categories: `character` (levenshtein, indel_ratio, hamming, jaro_winkler, partial_ratio), `token` (token_sort, token_set, tfidf_cosine), `phonetic` (soundex, metaphone) and `semantic` (embedding).
+Built-in methods fall into three categories: `character` (levenshtein, indel_ratio, hamming, jaro_winkler, partial_ratio), `token` (token_sort, token_set, tfidf_cosine) and `phonetic` (soundex, metaphone). An `Embedding` falls into `semantic`.
 
 **Each method has its own scale.** Two unrelated names, "Jean Dupont" and "Marie Curie", get 0.49 from `jaro_winkler` but 0 from `tfidf_cosine`. Compare a method's scores across pairs and choose a threshold per method, never compare the scores of two methods.
 
@@ -66,7 +66,7 @@ Matcher(categories="token")
 Matcher.available_methods()
 ```
 
-`Matcher()` runs every built-in method except `embedding`.
+`Matcher()` runs every built-in method. Embeddings are added with `add_method`: see [Semantic similarity](#semantic-similarity).
 
 ### Preprocess
 
@@ -88,6 +88,8 @@ scores = batch.to_pandas()  # str1, str2, then one column per method
 m.compare_one_to_many("paris", ["paris", "pari", "lyon"])
 ```
 
+To compare one string with many, prefer `compare_one_to_many`: it preprocesses the query once, and `tfidf_cosine`, the phonetic methods and an `Embedding` encode it once.
+
 A method that does not apply to a pair gets NaN. With pairs labelled as duplicates or not, see which methods tell them apart best:
 
 ```python
@@ -106,24 +108,31 @@ Both return a matplotlib `Axes` and accept `ax=` to draw into your own figure.
 
 ### Semantic similarity
 
-Character and word methods cannot tell that *voiture* and *automobile* mean the same thing; embeddings can. The `embedding` method is opt-in: it requires the `embeddings` extra and downloads its model on first use.
-
-```python
-Matcher(["levenshtein", "embedding"]).compare("voiture rouge", "automobile rouge")
-# embedding 0.996, levenshtein 0.500
-```
-
-The default model is [paraphrase-multilingual-MiniLM-L12-v2](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2) (50+ languages, Apache-2.0, 0.22 GB). `Embedding` accepts any other model, or any function turning a list of texts into vectors:
+Character and word methods cannot tell that *voiture* and *automobile* mean the same thing; embeddings can. PARISIM has no default model: choose the model, the library that loads it and the number of texts per call. A missing one raises an error.
 
 ```python
 from parisim import Embedding
 
-m.add_method("bge", Embedding("BAAI/bge-small-en-v1.5"))  # fastembed
-m.add_method("minilm", Embedding("all-MiniLM-L6-v2", backend="sentence-transformers"))
-m.add_method("api", Embedding(encode))  # e.g. calls OpenAI or Mistral
+multilingual = Embedding(
+    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    backend="fastembed",
+    batch_size=256,
+)
+m = Matcher("levenshtein")
+m.add_method("embedding", multilingual)
+m.compare("voiture rouge", "automobile rouge")
+# embedding 0.996, levenshtein 0.500
 ```
 
-Vectors are cached, and a batch is encoded in a few large calls. Check the licence of the model you pick: some, such as jina-embeddings-v3, forbid commercial use.
+`backend` is `"fastembed"` (the `embeddings` extra) or `"sentence-transformers"`, and the model is downloaded on first use. This one covers 50+ languages (Apache-2.0, 0.22 GB). `Embedding` also takes any function turning a list of texts into vectors, such as an embedding API:
+
+```python
+minilm = Embedding("all-MiniLM-L6-v2", backend="sentence-transformers", batch_size=32)
+m.add_method("minilm", minilm)
+m.add_method("api", Embedding(encode, batch_size=100))  # e.g. calls OpenAI or Mistral
+```
+
+Vectors are cached, and a batch is encoded `batch_size` texts per call. Check the licence of the model you pick: some, such as jina-embeddings-v3, forbid commercial use.
 
 ### Custom methods
 
@@ -139,6 +148,8 @@ from parisim.methods import tfidf_cosine
 
 m.add_method("tfidf_1_letter", partial(tfidf_cosine, token_pattern=r"(?u)\b\w+\b"))
 ```
+
+A method can also have a `one_to_many(query, candidates)` attribute returning one score per candidate: `compare_one_to_many` then calls it once instead of calling the method on each pair.
 
 ### Errors
 
